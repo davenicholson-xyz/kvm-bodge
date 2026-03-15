@@ -196,8 +196,9 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
-						log.Printf("[%s] push-through — sending mouse to client", remote)
-						writeCh <- proto.Message{Type: proto.MsgMouseEnter}
+						pct := edgePosPct(nx, ny, side, screenW, screenH)
+						log.Printf("[%s] push-through — sending mouse to client (edge pos %.1f%%)", remote, pct*100)
+						writeCh <- proto.Message{Type: proto.MsgMouseEnter, Payload: proto.EncodeEdgePos(pct)}
 					}
 				} else {
 					dbg("remote move (%+d,%+d) scroll(%+d,%+d)", ev.DX, ev.DY, ev.WheelV, ev.WheelH)
@@ -232,7 +233,12 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 				if err := mouse.Ungrab(); err != nil {
 					log.Printf("[%s] ungrab failed: %v", remote, err)
 				}
-				vx, vy = returnVirtualPos(side, screenW, screenH)
+				if len(m.Payload) >= 2 {
+					pct := proto.DecodeEdgePos(m.Payload)
+					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
+				} else {
+					vx, vy = returnVirtualPos(side, screenW, screenH)
+				}
 				log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
 
 			case proto.MsgBye:
@@ -257,6 +263,41 @@ func pushThrough(oldX, oldY int, ev evdev.Event, side byte, w, h int) bool {
 		return oldY == 0 && ev.DY < 0
 	}
 	return false
+}
+
+// edgePosPct returns a 0.0–1.0 fraction representing where along the crossing
+// edge the cursor is. For left/right crossings it's the Y fraction; for
+// top/bottom crossings it's the X fraction.
+func edgePosPct(vx, vy int, side byte, w, h int) float64 {
+	switch side {
+	case proto.SideRight, proto.SideLeft:
+		if h <= 1 {
+			return 0.5
+		}
+		return float64(vy) / float64(h-1)
+	case proto.SideTop, proto.SideBottom:
+		if w <= 1 {
+			return 0.5
+		}
+		return float64(vx) / float64(w-1)
+	}
+	return 0.5
+}
+
+// returnVirtualPosFromPct places the virtual cursor back at the return edge
+// using the percentage received from the client.
+func returnVirtualPosFromPct(side byte, w, h int, pct float64) (x, y int) {
+	switch side {
+	case proto.SideRight:
+		return w - 20, int(pct * float64(h-1))
+	case proto.SideLeft:
+		return 20, int(pct * float64(h-1))
+	case proto.SideTop:
+		return int(pct * float64(w-1)), 20
+	case proto.SideBottom:
+		return int(pct * float64(w-1)), h - 20
+	}
+	return w / 2, h / 2
 }
 
 func returnVirtualPos(side byte, w, h int) (x, y int) {

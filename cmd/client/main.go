@@ -129,7 +129,12 @@ func main() {
 
 			case proto.MsgMouseEnter:
 				remoteMode = true
-				vx, vy = entryPos(side, screenW, screenH)
+				if len(m.Payload) >= 2 {
+					pct := proto.DecodeEdgePos(m.Payload)
+					vx, vy = entryPosFromPct(side, screenW, screenH, pct)
+				} else {
+					vx, vy = entryPos(side, screenW, screenH)
+				}
 				moveMouse(vx, vy, false)
 				log.Printf("mouse entered from server — placed at (%d,%d)", vx, vy)
 
@@ -151,8 +156,9 @@ func main() {
 
 				if atReturnEdge(vx, vy, dx, dy, side, screenW, screenH) && len(pressedButtons) == 0 {
 					remoteMode = false
-					writeCh <- proto.Message{Type: proto.MsgMouseLeave}
-					log.Printf("return edge — mouse back to server")
+					pct := edgePosPct(vx, vy, side, screenW, screenH)
+					writeCh <- proto.Message{Type: proto.MsgMouseLeave, Payload: proto.EncodeEdgePos(pct)}
+					log.Printf("return edge — mouse back to server (edge pos %.1f%%)", pct*100)
 				}
 
 			case proto.MsgMouseButton:
@@ -184,20 +190,42 @@ func main() {
 	}
 }
 
-// entryPos is where the cursor appears on this screen when the mouse enters from the server.
-// The entry side is opposite to where this monitor sits relative to the server.
-func entryPos(side byte, w, h int) (x, y int) {
+// entryPosFromPct places the cursor at the same relative position along the
+// entry edge as the server's cursor was along the exit edge.
+func entryPosFromPct(side byte, w, h int, pct float64) (x, y int) {
 	switch side {
 	case proto.SideRight: // client is right → mouse enters from left
-		return 2, h / 2
+		return 2, int(pct * float64(h-1))
 	case proto.SideLeft: // client is left → mouse enters from right
-		return w - 2, h / 2
+		return w - 2, int(pct * float64(h-1))
 	case proto.SideTop: // client is above → mouse enters from bottom
-		return w / 2, h - 2
+		return int(pct * float64(w-1)), h - 2
 	case proto.SideBottom: // client is below → mouse enters from top
-		return w / 2, 2
+		return int(pct * float64(w-1)), 2
 	}
 	return w / 2, h / 2
+}
+
+// entryPos falls back to center when no percentage is available.
+func entryPos(side byte, w, h int) (x, y int) {
+	return entryPosFromPct(side, w, h, 0.5)
+}
+
+// edgePosPct returns 0.0–1.0 for where along the crossing edge the cursor sits.
+func edgePosPct(vx, vy int, side byte, w, h int) float64 {
+	switch side {
+	case proto.SideRight, proto.SideLeft:
+		if h <= 1 {
+			return 0.5
+		}
+		return float64(vy) / float64(h-1)
+	case proto.SideTop, proto.SideBottom:
+		if w <= 1 {
+			return 0.5
+		}
+		return float64(vx) / float64(w-1)
+	}
+	return 0.5
 }
 
 // atReturnEdge returns true when the virtual position is clamped at the return

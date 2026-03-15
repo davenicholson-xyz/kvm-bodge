@@ -120,3 +120,15 @@ func DecodeMouseButton(b []byte) (button uint16, pressed bool) {
 	pressed = b[2] != 0
 	return
 }
+
+// EncodeEdgePos encodes a 0.0–1.0 position along an edge as 2 bytes (uint16).
+func EncodeEdgePos(pct float64) []byte {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, uint16(pct*65535))
+	return b
+}
+
+// DecodeEdgePos decodes a 2-byte edge position into a 0.0–1.0 float.
+func DecodeEdgePos(b []byte) float64 {
+	return float64(binary.BigEndian.Uint16(b)) / 65535.0
+}
