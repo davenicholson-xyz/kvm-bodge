@@ -16,8 +16,17 @@ import (
 	"kvm-bodge/internal/proto"
 )
 
+var debug bool
+
+func dbg(format string, args ...any) {
+	if debug {
+		log.Printf("[debug] "+format, args...)
+	}
+}
+
 func main() {
 	port := flag.Int("port", 7777, "TCP port to listen on")
+	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -120,16 +129,22 @@ func handleClient(c net.Conn) {
 	var remoteMode atomic.Bool
 	screenW, screenH := robotgo.GetScreenSize()
 	centerX, centerY := screenW/2, screenH/2
+	log.Printf("[%s] screen size %dx%d, watching %s edge", remote, screenW, screenH, sideNames[side])
 
 	go func() {
 		ticker := time.NewTicker(8 * time.Millisecond) // ~120 Hz
 		defer ticker.Stop()
+		var lastX, lastY int
 		for range ticker.C {
 			x, y := robotgo.GetMousePos()
 			if !remoteMode.Load() {
+				if x != lastX || y != lastY {
+					dbg("mouse pos (%d, %d)", x, y)
+					lastX, lastY = x, y
+				}
 				if atEdge(x, y, side, screenW, screenH) {
 					remoteMode.Store(true)
-					log.Printf("[%s] mouse leaving to client", remote)
+					log.Printf("[%s] edge hit at (%d,%d) — sending mouse to client", remote, x, y)
 					writeCh <- proto.Message{Type: proto.MsgMouseEnter}
 					robotgo.Move(centerX, centerY)
 				}
@@ -137,6 +152,7 @@ func handleClient(c net.Conn) {
 				dx := x - centerX
 				dy := y - centerY
 				if dx != 0 || dy != 0 {
+					dbg("remote delta (%d, %d)", dx, dy)
 					writeCh <- proto.Message{
 						Type:    proto.MsgMouseDelta,
 						Payload: proto.EncodeMouseDelta(dx, dy),
@@ -167,10 +183,9 @@ func handleClient(c net.Conn) {
 
 			case proto.MsgMouseLeave:
 				remoteMode.Store(false)
-				// Return mouse to the edge we were watching.
 				rx, ry := returnPos(side, screenW, screenH)
 				robotgo.Move(rx, ry)
-				log.Printf("[%s] mouse returned to server", remote)
+				log.Printf("[%s] mouse returned to server — warped to (%d,%d)", remote, rx, ry)
 
 			case proto.MsgBye:
 				log.Printf("[%s] client said bye", remote)

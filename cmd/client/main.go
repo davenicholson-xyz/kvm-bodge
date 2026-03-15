@@ -16,10 +16,19 @@ import (
 	"kvm-bodge/internal/proto"
 )
 
+var debug bool
+
+func dbg(format string, args ...any) {
+	if debug {
+		log.Printf("[debug] "+format, args...)
+	}
+}
+
 func main() {
 	server := flag.String("server", "", "server IP or host (required)")
 	port := flag.Int("port", 7777, "server port")
 	sideStr := flag.String("side", "", "which side of the server this monitor is on: left|right|top|bottom (required)")
+	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
 	if *server == "" || *sideStr == "" {
@@ -91,6 +100,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	screenW, screenH := robotgo.GetScreenSize()
+	log.Printf("screen size %dx%d", screenW, screenH)
 	var remoteMode atomic.Bool
 
 	for {
@@ -114,7 +124,7 @@ func main() {
 				remoteMode.Store(true)
 				ex, ey := entryPos(side, screenW, screenH)
 				robotgo.Move(ex, ey)
-				log.Println("mouse entered from server")
+				log.Printf("mouse entered from server — placed at (%d,%d)", ex, ey)
 
 			case proto.MsgMouseDelta:
 				if !remoteMode.Load() || len(m.Payload) < 4 {
@@ -125,12 +135,13 @@ func main() {
 				nx := clamp(cx+dx, 0, screenW-1)
 				ny := clamp(cy+dy, 0, screenH-1)
 				robotgo.Move(nx, ny)
+				dbg("delta (%+d,%+d) cur (%d,%d) → (%d,%d)", dx, dy, cx, cy, nx, ny)
 
 				// Check if we've hit the return edge.
 				if atReturnEdge(nx, ny, side, screenW, screenH) {
 					remoteMode.Store(false)
 					writeCh <- proto.Message{Type: proto.MsgMouseLeave}
-					log.Println("mouse returned to server")
+					log.Printf("return edge hit at (%d,%d) — mouse back to server", nx, ny)
 				}
 
 			case proto.MsgBye:
