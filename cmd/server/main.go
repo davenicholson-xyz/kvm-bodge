@@ -107,8 +107,15 @@ func main() {
 func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, screenW, screenH int) {
 	remote := c.RemoteAddr()
 	log.Printf("[%s] connected", remote)
+	remoteMode := false
 	defer func() {
 		c.Close()
+		if remoteMode {
+			if err := mouse.Ungrab(); err != nil {
+				log.Printf("[%s] ungrab on disconnect: %v", remote, err)
+			}
+			log.Printf("[%s] ungrabbed mouse on disconnect", remote)
+		}
 		log.Printf("[%s] disconnected", remote)
 	}()
 
@@ -166,7 +173,6 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 	// clamped at the boundary and the user keeps pushing in that direction.
 	// This is robust to any OS pointer speed/acceleration setting.
 	vx, vy := screenW/2, screenH/2
-	remoteMode := false
 
 	for {
 		select {
