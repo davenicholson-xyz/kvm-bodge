@@ -86,20 +86,33 @@ func Open(device string) (*Reader, error) {
 	return &Reader{f: f, device: device}, nil
 }
 
-// OpenKeyboard opens the given evdev keyboard device. Pass an empty string to auto-detect.
-func OpenKeyboard(device string) (*Reader, error) {
-	if device == "" {
+// OpenKeyboards opens all detected keyboard evdev devices (or just the one
+// specified). Pass an empty string to auto-detect. Returns at least one Reader
+// or an error.
+func OpenKeyboards(device string) ([]*Reader, error) {
+	var devices []string
+	if device != "" {
+		devices = []string{device}
+	} else {
 		var err error
-		device, err = findKeyboardDevice()
+		devices, err = findKeyboardDevices()
 		if err != nil {
 			return nil, fmt.Errorf("auto-detect keyboard: %w", err)
 		}
 	}
-	f, err := os.Open(device)
-	if err != nil {
-		return nil, err
+	var readers []*Reader
+	for _, d := range devices {
+		f, err := os.Open(d)
+		if err != nil {
+			log.Printf("evdev: open keyboard %s: %v", d, err)
+			continue
+		}
+		readers = append(readers, &Reader{f: f, device: d})
 	}
-	return &Reader{f: f, device: device}, nil
+	if len(readers) == 0 {
+		return nil, fmt.Errorf("could not open any keyboard device")
+	}
+	return readers, nil
 }
 
 func (r *Reader) Device() string { return r.device }
@@ -297,30 +310,31 @@ func findMouseFromProc() (string, error) {
 	return best.event, nil
 }
 
-// findKeyboardDevice returns the most appropriate keyboard evdev path.
-func findKeyboardDevice() (string, error) {
-	if dev, err := globFirst("/dev/input/by-id/*-event-kbd"); err == nil {
-		return dev, nil
+// findKeyboardDevices returns all keyboard evdev paths found.
+func findKeyboardDevices() ([]string, error) {
+	// by-id symlinks are most reliable; grab all of them.
+	if devs, _ := filepath.Glob("/dev/input/by-id/*-event-kbd"); len(devs) > 0 {
+		return devs, nil
 	}
-	if dev, err := globFirst("/dev/input/by-path/*-event-kbd"); err == nil {
-		return dev, nil
+	if devs, _ := filepath.Glob("/dev/input/by-path/*-event-kbd"); len(devs) > 0 {
+		return devs, nil
 	}
-	return findKeyboardFromProc()
+	return findKeyboardsFromProc()
 }
 
 // evRep is the EV_REP event type bit — present on keyboards, absent on mice.
 const evRep = 0x14
 
-func findKeyboardFromProc() (string, error) {
+func findKeyboardsFromProc() ([]string, error) {
 	data, err := os.ReadFile("/proc/bus/input/devices")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var evFlags uint64
 	var handlers []string
 	var name string
-	best := ""
+	var found []string
 
 	flush := func() {
 		defer func() { evFlags = 0; handlers = nil; name = "" }()
@@ -332,23 +346,15 @@ func findKeyboardFromProc() (string, error) {
 			return
 		}
 		var eventNode string
-		// Prefer devices with "keyboard" in name or "kbd" handler, but accept any match.
-		hasKbd := strings.Contains(strings.ToLower(name), "keyboard")
 		for _, h := range handlers {
 			if strings.HasPrefix(h, "event") {
 				eventNode = "/dev/input/" + h
-			}
-			if h == "kbd" {
-				hasKbd = true
 			}
 		}
 		if eventNode == "" {
 			return
 		}
-		// Prefer explicit keyboard devices; fall back to any EV_KEY+EV_REP device.
-		if best == "" || hasKbd {
-			best = eventNode
-		}
+		found = append(found, eventNode)
 	}
 
 	for _, line := range strings.Split(string(data), "\n") {
@@ -368,9 +374,10 @@ func findKeyboardFromProc() (string, error) {
 		}
 	}
 	flush()
+	_ = name
 
-	if best == "" {
-		return "", fmt.Errorf("no keyboard device found in /proc/bus/input/devices")
+	if len(found) == 0 {
+		return nil, fmt.Errorf("no keyboard device found in /proc/bus/input/devices")
 	}
-	return best, nil
+	return found, nil
 }

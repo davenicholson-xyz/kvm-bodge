@@ -65,14 +65,16 @@ func main() {
 	defer mouse.Close()
 	log.Printf("reading mouse from %s", mouse.Device())
 
-	// Keyboard device (optional).
-	var keyboard *evdev.Reader
-	if kb, err := evdev.OpenKeyboard(*kbInput); err != nil {
+	// Keyboard devices (optional, may be multiple).
+	var keyboards []*evdev.Reader
+	if kbs, err := evdev.OpenKeyboards(*kbInput); err != nil {
 		log.Printf("keyboard not found: %v — keyboard forwarding disabled", err)
 	} else {
-		keyboard = kb
-		defer keyboard.Close()
-		log.Printf("reading keyboard from %s", keyboard.Device())
+		keyboards = kbs
+		for _, kb := range keyboards {
+			defer kb.Close()
+			log.Printf("reading keyboard from %s", kb.Device())
+		}
 	}
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -94,10 +96,11 @@ func main() {
 	}()
 
 	kbCh := make(chan evdev.Event, 256)
-	if keyboard != nil {
+	for _, kb := range keyboards {
+		kb := kb
 		go func() {
-			if err := keyboard.ReadEvents(kbCh); err != nil {
-				log.Fatalf("evdev keyboard read: %v", err)
+			if err := kb.ReadEvents(kbCh); err != nil {
+				log.Printf("evdev keyboard read %s: %v", kb.Device(), err)
 			}
 		}()
 	}
@@ -119,12 +122,12 @@ func main() {
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
-			handleClient(c, mouse, keyboard, evCh, kbCh, screenW, screenH)
+			handleClient(c, mouse, keyboards, evCh, kbCh, screenW, screenH)
 		}
 	}
 }
 
-func handleClient(c net.Conn, mouse *evdev.Reader, keyboard *evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int) {
+func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int) {
 	remote := c.RemoteAddr()
 	log.Printf("[%s] connected", remote)
 	remoteMode := false
@@ -134,9 +137,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboard *evdev.Reader, evCh 
 			if err := mouse.Ungrab(); err != nil {
 				log.Printf("[%s] ungrab on disconnect: %v", remote, err)
 			}
-			if keyboard != nil {
-				keyboard.Ungrab()
-			}
+			for _, kb := range keyboards { kb.Ungrab() }
 			log.Printf("[%s] ungrabbed devices on disconnect", remote)
 		}
 		log.Printf("[%s] disconnected", remote)
@@ -223,15 +224,19 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboard *evdev.Reader, evCh 
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
-						if keyboard != nil {
-							if err := keyboard.Grab(); err != nil {
-								log.Printf("[%s] keyboard grab failed: %v", remote, err)
+					if len(keyboards) > 0 {
+						grabOK := 0
+						for _, kb := range keyboards {
+							if err := kb.Grab(); err != nil {
+								log.Printf("[%s] keyboard grab %s failed: %v", remote, kb.Device(), err)
 							} else {
-								log.Printf("[%s] keyboard grabbed OK", remote)
+								grabOK++
 							}
-						} else {
-							log.Printf("[%s] no keyboard device -- forwarding disabled", remote)
 						}
+						log.Printf("[%s] keyboard grabbed %d/%d devices", remote, grabOK, len(keyboards))
+					} else {
+						log.Printf("[%s] no keyboard device -- forwarding disabled", remote)
+					}
 						// Use actual cursor position for accurate edge percentage;
 						// fall back to virtual position if xdotool is unavailable.
 						ex, ey := nx, ny
@@ -286,9 +291,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboard *evdev.Reader, evCh 
 				if err := mouse.Ungrab(); err != nil {
 					log.Printf("[%s] ungrab failed: %v", remote, err)
 				}
-				if keyboard != nil {
-					keyboard.Ungrab()
-				}
+				for _, kb := range keyboards { kb.Ungrab() }
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
