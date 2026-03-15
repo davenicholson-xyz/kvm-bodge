@@ -141,6 +141,34 @@ func findDisplayEnv() (display, xauth string) {
 	return
 }
 
+// readCursorPos returns the actual OS cursor position using xdotool.
+// Returns (x, y, true) on success, (0, 0, false) if xdotool is unavailable.
+func readCursorPos(w, h int) (int, int, bool) {
+	xdotool := findBin("xdotool")
+	if xdotool == "" {
+		return 0, 0, false
+	}
+	display, xauth := findDisplayEnv()
+	if display == "" {
+		return 0, 0, false
+	}
+	env := []string{"DISPLAY=" + display}
+	if xauth != "" {
+		env = append(env, "XAUTHORITY="+xauth)
+	}
+	cmd := exec.Command(xdotool, "getmouselocation")
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, false
+	}
+	var x, y int
+	if n, _ := fmt.Sscanf(string(out), "x:%d y:%d", &x, &y); n != 2 {
+		return 0, 0, false
+	}
+	return clamp(x, 0, w-1), clamp(y, 0, h-1), true
+}
+
 // findBin looks for a binary in PATH and common NixOS system locations.
 func findBin(name string) string {
 	if p, err := exec.LookPath(name); err == nil {

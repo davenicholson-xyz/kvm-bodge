@@ -168,8 +168,15 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 		}
 	}()
 
-	// Warp the OS cursor to a known position and seed the virtual tracker there.
-	vx, vy := warpMouseToCenter(screenW, screenH)
+	// Seed the virtual tracker from the real cursor position if possible,
+	// otherwise warp to a known position so vx/vy is accurate.
+	var vx, vy int
+	if rx, ry, ok := readCursorPos(screenW, screenH); ok {
+		vx, vy = rx, ry
+		log.Printf("[%s] seeded virtual cursor from real pos (%d,%d)", remote, vx, vy)
+	} else {
+		vx, vy = warpMouseToCenter(screenW, screenH)
+	}
 	pressedButtons := map[uint16]bool{}
 
 	for {
@@ -193,7 +200,13 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
-						pct := edgePosPct(nx, ny, side, screenW, screenH)
+						// Use actual cursor position for accurate edge percentage;
+						// fall back to virtual position if xdotool is unavailable.
+						ex, ey := nx, ny
+						if ax, ay, ok := readCursorPos(screenW, screenH); ok {
+							ex, ey = ax, ay
+						}
+						pct := edgePosPct(ex, ey, side, screenW, screenH)
 						log.Printf("[%s] push-through — sending mouse to client (edge pos %.1f%%)", remote, pct*100)
 						writeCh <- proto.Message{Type: proto.MsgMouseEnter, Payload: proto.EncodeEdgePos(pct)}
 					}
@@ -235,6 +248,10 @@ func handleClient(c net.Conn, mouse *evdev.Reader, evCh <-chan evdev.Event, scre
 					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
 				} else {
 					vx, vy = returnVirtualPos(side, screenW, screenH)
+				}
+				// Re-sync virtual position to actual cursor to correct any drift.
+				if ax, ay, ok := readCursorPos(screenW, screenH); ok {
+					vx, vy = ax, ay
 				}
 				log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
 
