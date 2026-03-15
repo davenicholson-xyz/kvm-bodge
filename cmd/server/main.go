@@ -7,12 +7,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync/atomic"
+	"path/filepath"
+	"strings"
 	"syscall"
-	"time"
 
-	"github.com/go-vgo/robotgo"
-
+	"kvm-bodge/internal/evdev"
 	"kvm-bodge/internal/proto"
 )
 
@@ -26,8 +25,33 @@ func dbg(format string, args ...any) {
 
 func main() {
 	port := flag.Int("port", 7777, "TCP port to listen on")
+	input := flag.String("input", "", "evdev device path (default: auto-detect)")
+	screen := flag.String("screen", "", "screen resolution WxH override (default: auto-detect)")
 	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
+
+	// Screen size.
+	var screenW, screenH int
+	if *screen != "" {
+		if _, err := fmt.Sscanf(*screen, "%dx%d", &screenW, &screenH); err != nil || screenW <= 0 || screenH <= 0 {
+			log.Fatalf("invalid --screen %q: want WxH e.g. 1920x1080", *screen)
+		}
+	} else {
+		var err error
+		screenW, screenH, err = detectScreenSize()
+		if err != nil {
+			log.Fatalf("auto-detect screen size: %v\nHint: pass --screen WxH to set it manually", err)
+		}
+	}
+	log.Printf("screen size %dx%d", screenW, screenH)
+
+	// Mouse device.
+	mouse, err := evdev.Open(*input)
+	if err != nil {
+		log.Fatalf("open mouse device: %v", err)
+	}
+	defer mouse.Close()
+	log.Printf("reading mouse from %s", mouse.Device())
 
 	addr := fmt.Sprintf(":%d", *port)
 	ln, err := net.Listen("tcp", addr)
@@ -35,11 +59,17 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
-
 	log.Printf("KVM server listening on %s", addr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	deltaCh := make(chan evdev.Delta, 256)
+	go func() {
+		if err := mouse.ReadEvents(deltaCh); err != nil {
+			log.Fatalf("evdev read: %v", err)
+		}
+	}()
 
 	connCh := make(chan net.Conn)
 	go func() {
@@ -58,12 +88,12 @@ func main() {
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
-			go handleClient(c)
+			handleClient(c, deltaCh, screenW, screenH)
 		}
 	}
 }
 
-func handleClient(c net.Conn) {
+func handleClient(c net.Conn, deltaCh <-chan evdev.Delta, screenW, screenH int) {
 	remote := c.RemoteAddr()
 	log.Printf("[%s] connected", remote)
 	defer func() {
@@ -84,8 +114,6 @@ func handleClient(c net.Conn) {
 		log.Printf("[%s] bad hello", remote)
 		return
 	}
-
-	// Receive client info (side).
 	msg, err = proto.Read(c)
 	if err != nil || msg.Type != proto.MsgClientInfo || len(msg.Payload) < 1 {
 		log.Printf("[%s] bad client info", remote)
@@ -98,11 +126,9 @@ func handleClient(c net.Conn) {
 	}
 	log.Printf("[%s] handshake OK — client is to the %s", remote, sideNames[side])
 
-	// --- Set up goroutines ---
 	writeCh := make(chan proto.Message, 128)
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 2)
 
-	// Writer goroutine — serialises all writes to the connection.
 	go func() {
 		for msg := range writeCh {
 			if err := proto.Write(c, msg); err != nil {
@@ -112,7 +138,6 @@ func handleClient(c net.Conn) {
 		}
 	}()
 
-	// Reader goroutine.
 	inCh := make(chan proto.Message, 32)
 	go func() {
 		for {
@@ -125,47 +150,12 @@ func handleClient(c net.Conn) {
 		}
 	}()
 
-	// Mouse poller goroutine.
-	var remoteMode atomic.Bool
-	screenW, screenH := robotgo.GetScreenSize()
-	centerX, centerY := screenW/2, screenH/2
-	log.Printf("[%s] screen size %dx%d, watching %s edge", remote, screenW, screenH, sideNames[side])
-
-	go func() {
-		ticker := time.NewTicker(8 * time.Millisecond) // ~120 Hz
-		defer ticker.Stop()
-		var lastX, lastY int
-		for range ticker.C {
-			x, y := robotgo.GetMousePos()
-			if !remoteMode.Load() {
-				if x != lastX || y != lastY {
-					dbg("mouse pos (%d, %d)", x, y)
-					lastX, lastY = x, y
-				}
-				if atEdge(x, y, side, screenW, screenH) {
-					remoteMode.Store(true)
-					log.Printf("[%s] edge hit at (%d,%d) — sending mouse to client", remote, x, y)
-					writeCh <- proto.Message{Type: proto.MsgMouseEnter}
-					robotgo.Move(centerX, centerY)
-				}
-			} else {
-				dx := x - centerX
-				dy := y - centerY
-				if dx != 0 || dy != 0 {
-					dbg("remote delta (%d, %d)", dx, dy)
-					writeCh <- proto.Message{
-						Type:    proto.MsgMouseDelta,
-						Payload: proto.EncodeMouseDelta(dx, dy),
-					}
-					robotgo.Move(centerX, centerY)
-				}
-			}
-		}
-	}()
-
-	// Heartbeat ticker.
-	heartbeat := time.NewTicker(3 * time.Second)
-	defer heartbeat.Stop()
+	// Virtual cursor — tracks position from raw evdev deltas.
+	// Edge is triggered by "push-through": when the virtual position is already
+	// clamped at the boundary and the user keeps pushing in that direction.
+	// This is robust to any OS pointer speed/acceleration setting.
+	vx, vy := screenW/2, screenH/2
+	remoteMode := false
 
 	for {
 		select {
@@ -173,8 +163,27 @@ func handleClient(c net.Conn) {
 			log.Printf("[%s] error: %v", remote, err)
 			return
 
-		case <-heartbeat.C:
-			writeCh <- proto.Message{Type: proto.MsgHeartbeatPing}
+		case d := <-deltaCh:
+			if !remoteMode {
+				nx := clamp(vx+d.DX, 0, screenW-1)
+				ny := clamp(vy+d.DY, 0, screenH-1)
+				dbg("virtual (%d,%d) → (%d,%d) delta (%+d,%+d)", vx, vy, nx, ny, d.DX, d.DY)
+
+				triggered := pushThrough(vx, vy, d, side, screenW, screenH)
+				vx, vy = nx, ny
+
+				if triggered {
+					remoteMode = true
+					log.Printf("[%s] push-through at (%d,%d) — sending mouse to client", remote, vx, vy)
+					writeCh <- proto.Message{Type: proto.MsgMouseEnter}
+				}
+			} else {
+				dbg("remote delta (%+d,%+d)", d.DX, d.DY)
+				writeCh <- proto.Message{
+					Type:    proto.MsgMouseDelta,
+					Payload: proto.EncodeMouseDelta(d.DX, d.DY),
+				}
+			}
 
 		case m := <-inCh:
 			switch m.Type {
@@ -182,10 +191,9 @@ func handleClient(c net.Conn) {
 				// OK
 
 			case proto.MsgMouseLeave:
-				remoteMode.Store(false)
-				rx, ry := returnPos(side, screenW, screenH)
-				robotgo.Move(rx, ry)
-				log.Printf("[%s] mouse returned to server — warped to (%d,%d)", remote, rx, ry)
+				remoteMode = false
+				vx, vy = returnVirtualPos(side, screenW, screenH)
+				log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
 
 			case proto.MsgBye:
 				log.Printf("[%s] client said bye", remote)
@@ -195,32 +203,59 @@ func handleClient(c net.Conn) {
 	}
 }
 
-// atEdge returns true when (x,y) is at the screen edge corresponding to the client's side.
-func atEdge(x, y int, side byte, w, h int) bool {
+// pushThrough returns true when the virtual position was already at the edge
+// and the incoming delta is still pushing in that direction.
+func pushThrough(oldX, oldY int, d evdev.Delta, side byte, w, h int) bool {
 	switch side {
 	case proto.SideRight:
-		return x >= w-2
+		return oldX == w-1 && d.DX > 0
 	case proto.SideLeft:
-		return x <= 1
-	case proto.SideTop:
-		return y <= 1
+		return oldX == 0 && d.DX < 0
 	case proto.SideBottom:
-		return y >= h-2
+		return oldY == h-1 && d.DY > 0
+	case proto.SideTop:
+		return oldY == 0 && d.DY < 0
 	}
 	return false
 }
 
-// returnPos gives a sensible mouse position on the server when control returns.
-func returnPos(side byte, w, h int) (x, y int) {
+func returnVirtualPos(side byte, w, h int) (x, y int) {
 	switch side {
 	case proto.SideRight:
-		return w - 10, h / 2
+		return w - 20, h / 2
 	case proto.SideLeft:
-		return 10, h / 2
+		return 20, h / 2
 	case proto.SideTop:
-		return w / 2, 10
+		return w / 2, 20
 	case proto.SideBottom:
-		return w / 2, h - 10
+		return w / 2, h - 20
 	}
 	return w / 2, h / 2
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// detectScreenSize reads the first connected output's preferred mode from sysfs.
+func detectScreenSize() (w, h int, err error) {
+	files, _ := filepath.Glob("/sys/class/drm/*/modes")
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		line := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]
+		if _, err := fmt.Sscanf(line, "%dx%d", &w, &h); err == nil && w > 0 && h > 0 {
+			log.Printf("detected screen from %s: %dx%d", f, w, h)
+			return w, h, nil
+		}
+	}
+	return 0, 0, fmt.Errorf("no resolution found in /sys/class/drm/*/modes")
 }
