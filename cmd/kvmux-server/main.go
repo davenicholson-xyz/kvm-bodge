@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/davenicholson-xyz/kvmux/internal/evdev"
 	"github.com/davenicholson-xyz/kvmux/internal/proto"
@@ -219,6 +220,8 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 	warpMouseToCenter(screenW, screenH)
 	vx, vy := screenW/2, screenH/2
 	pressedButtons := map[uint16]bool{}
+	var pendingRemote bool
+	var enterTimeout <-chan time.Time
 
 	for {
 		select {
@@ -230,18 +233,28 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 			log.Printf("[%s] error: %v", remote, err)
 			return
 
+		case <-enterTimeout:
+			if pendingRemote {
+				log.Printf("[%s] no ack for MsgMouseEnter — reverting to local", remote)
+				pendingRemote = false
+				mouse.Ungrab()
+				for _, kb := range keyboards { kb.Ungrab() }
+				sb.publish(Status{Connected: true, Remote: false, Client: remote.String()})
+			}
+			enterTimeout = nil
+
 		case ev := <-evCh:
 			switch ev.Kind {
 			case evdev.KindMove:
-				if !remoteMode {
+				if !remoteMode && !pendingRemote {
 					if ax, ay, ok := readCursorPosHyprland(screenW, screenH); ok {
 						vx, vy = ax, ay
 					}
 					dbg("actual pos (%d,%d) delta (%+d,%+d)", vx, vy, ev.DX, ev.DY)
 					triggered := pushThrough(vx, vy, ev, side, screenW, screenH)
 					if triggered && len(pressedButtons) == 0 {
-						remoteMode = true
-						sb.publish(Status{Connected: true, Remote: true, Client: remote.String()})
+						pendingRemote = true
+						enterTimeout = time.After(2 * time.Second)
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
@@ -251,7 +264,7 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 							}
 						}
 						pct := edgePosPct(vx, vy, side, screenW, screenH)
-						log.Printf("[%s] \u2192 client (%.1f%%)", remote, pct*100)
+						log.Printf("[%s] \u2192 client (%.1f%%) — awaiting ack", remote, pct*100)
 						writeCh <- proto.Message{Type: proto.MsgMouseEnter, Payload: proto.EncodeEdgePos(pct)}
 					}
 				} else {
@@ -292,6 +305,15 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 			switch m.Type {
 			case proto.MsgHeartbeatPong:
 				// OK
+
+			case proto.MsgMouseEnterAck:
+				if pendingRemote {
+					pendingRemote = false
+					enterTimeout = nil
+					remoteMode = true
+					sb.publish(Status{Connected: true, Remote: true, Client: remote.String()})
+					log.Printf("[%s] ack received — remote mode active", remote)
+				}
 
 			case proto.MsgMouseLeave:
 				remoteMode = false

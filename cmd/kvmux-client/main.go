@@ -148,6 +148,7 @@ func main() {
 					log.Printf("mouse entered from server — placed at (%d,%d)", vx, vy)
 				}
 				moveMouse(vx, vy, false)
+				writeCh <- proto.Message{Type: proto.MsgMouseEnterAck}
 
 			case proto.MsgMouseDelta:
 				if !remoteMode || len(m.Payload) < 8 {
