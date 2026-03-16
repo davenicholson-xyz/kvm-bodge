@@ -141,6 +141,58 @@ func findDisplayEnv() (display, xauth string) {
 	return
 }
 
+// detectScreenByCornerSlam determines the screen dimensions in xdotool's
+// coordinate space by moving the cursor to a far corner and reading where it
+// actually lands. This is the most reliable method because it bypasses all
+// scale-factor ambiguity — the returned size is guaranteed to match
+// getmouselocation's coordinate space. The cursor is restored afterwards.
+func detectScreenByCornerSlam() (w, h int, err error) {
+	xdotool := findBin("xdotool")
+	if xdotool == "" {
+		return 0, 0, fmt.Errorf("xdotool not found")
+	}
+	display, xauth := findDisplayEnv()
+	if display == "" {
+		return 0, 0, fmt.Errorf("no DISPLAY found")
+	}
+	env := []string{"DISPLAY=" + display}
+	if xauth != "" {
+		env = append(env, "XAUTHORITY="+xauth)
+	}
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(xdotool, args...)
+		cmd.Env = env
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
+	}
+
+	// Remember where the cursor is so we can restore it.
+	origOut, origErr := run("getmouselocation")
+
+	// Slam to the far corner — the OS clamps it to the screen edge.
+	if _, err := run("mousemove", "99999", "99999"); err != nil {
+		return 0, 0, fmt.Errorf("xdotool mousemove: %w", err)
+	}
+	out, err := run("getmouselocation")
+	if err != nil {
+		return 0, 0, fmt.Errorf("xdotool getmouselocation: %w", err)
+	}
+	var maxX, maxY int
+	if n, _ := fmt.Sscanf(out, "x:%d y:%d", &maxX, &maxY); n != 2 || maxX <= 0 || maxY <= 0 {
+		return 0, 0, fmt.Errorf("unexpected getmouselocation output: %q", out)
+	}
+
+	// Restore cursor position.
+	if origErr == nil {
+		var ox, oy int
+		if n, _ := fmt.Sscanf(origOut, "x:%d y:%d", &ox, &oy); n == 2 {
+			run("mousemove", strconv.Itoa(ox), strconv.Itoa(oy)) //nolint:errcheck
+		}
+	}
+
+	return maxX + 1, maxY + 1, nil
+}
+
 // readCursorPos returns the actual OS cursor position using xdotool.
 // Returns (x, y, true) on success, (0, 0, false) if xdotool is unavailable.
 func readCursorPos(w, h int) (int, int, bool) {

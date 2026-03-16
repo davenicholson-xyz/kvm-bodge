@@ -34,28 +34,44 @@ func main() {
 	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
-	// Physical screen size.
-	var physW, physH int
+	// Screen size in xdotool coordinate space.
+	// We use xdotool getdisplaygeometry by default so that screenW/H are in
+	// the same coordinate space as xdotool getmouselocation — this is what
+	// makes edge-position percentages correct.  The old sysfs+scale path is
+	// kept as a fallback and for when --screen is given explicitly.
+	var screenW, screenH int
 	if *screen != "" {
+		var physW, physH int
 		if _, err := fmt.Sscanf(*screen, "%dx%d", &physW, &physH); err != nil || physW <= 0 || physH <= 0 {
 			log.Fatalf("invalid --screen %q: want WxH e.g. 1920x1080", *screen)
 		}
+		scale := *scaleFlag
+		if scale <= 0 {
+			scale = 1.0
+		}
+		screenW = int(math.Round(float64(physW) / scale))
+		screenH = int(math.Round(float64(physH) / scale))
+		log.Printf("screen %dx%d (from --screen flag, scale %.2f)", screenW, screenH, scale)
+	} else if w, h, err := detectScreenByCornerSlam(); err == nil {
+		screenW, screenH = w, h
+		log.Printf("screen %dx%d (corner-slam — guaranteed to match cursor coordinate space)", screenW, screenH)
+		if *scaleFlag > 0 {
+			log.Printf("note: --scale ignored when corner-slam detection succeeds")
+		}
 	} else {
-		var err error
-		physW, physH, err = detectScreenSize()
+		log.Printf("corner-slam unavailable (%v) — falling back to sysfs+kwinrc scale", err)
+		physW, physH, err := detectScreenSize()
 		if err != nil {
 			log.Fatalf("auto-detect screen size: %v\nHint: pass --screen WxH to set it manually", err)
 		}
+		scale := *scaleFlag
+		if scale <= 0 {
+			scale = detectScaleFactor()
+		}
+		screenW = int(math.Round(float64(physW) / scale))
+		screenH = int(math.Round(float64(physH) / scale))
+		log.Printf("screen: physical %dx%d scale %.2f → logical %dx%d", physW, physH, scale, screenW, screenH)
 	}
-
-	// Scale factor → logical resolution.
-	scale := *scaleFlag
-	if scale <= 0 {
-		scale = detectScaleFactor()
-	}
-	screenW := int(math.Round(float64(physW) / scale))
-	screenH := int(math.Round(float64(physH) / scale))
-	log.Printf("physical %dx%d  scale %.2f  logical %dx%d", physW, physH, scale, screenW, screenH)
 
 	// Mouse device.
 	mouse, err := evdev.Open(*input)
