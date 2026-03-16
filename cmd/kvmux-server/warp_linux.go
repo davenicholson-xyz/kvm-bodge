@@ -3,8 +3,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -59,9 +63,14 @@ type warpEvent struct {
 // the virtual starting position (vx, vy) that matches where the cursor ended up.
 // If only a corner slam is possible it returns (0, 0).
 func warpMouseToCenter(w, h int) (vx, vy int) {
-	display, xauth := findDisplayEnv()
+	// --- try Hyprland IPC first (logical coordinates, no scale confusion) ---
+	if err := warpCursorHyprland(w/2, h/2); err == nil {
+		log.Printf("cursor warped to centre (%d,%d) via hyprctl", w/2, h/2)
+		return w / 2, h / 2
+	}
 
 	// --- try xdotool ---
+	display, xauth := findDisplayEnv()
 	xdotool := findBin("xdotool")
 	if xdotool != "" && display != "" {
 		env := []string{"DISPLAY=" + display}
@@ -141,6 +150,152 @@ func findDisplayEnv() (display, xauth string) {
 	return
 }
 
+// findHyprlandEnv finds HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR from
+// the user's process environment (needed when running under sudo).
+func findHyprlandEnv() (sig, runtimeDir string) {
+	sig = os.Getenv("HYPRLAND_INSTANCE_SIGNATURE")
+	runtimeDir = os.Getenv("XDG_RUNTIME_DIR")
+	if sig != "" && runtimeDir != "" {
+		return
+	}
+	username := os.Getenv("SUDO_USER")
+	if username == "" {
+		username = os.Getenv("USER")
+	}
+	u, err := user.Lookup(username)
+	if err != nil {
+		return
+	}
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := os.Lstat("/proc/" + e.Name())
+		if err != nil {
+			continue
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || strconv.Itoa(int(st.Uid)) != u.Uid {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
+		if err != nil {
+			continue
+		}
+		for _, kv := range strings.Split(string(data), "\x00") {
+			if sig == "" && strings.HasPrefix(kv, "HYPRLAND_INSTANCE_SIGNATURE=") {
+				sig = strings.TrimPrefix(kv, "HYPRLAND_INSTANCE_SIGNATURE=")
+			}
+			if runtimeDir == "" && strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") {
+				runtimeDir = strings.TrimPrefix(kv, "XDG_RUNTIME_DIR=")
+			}
+		}
+		if sig != "" && runtimeDir != "" {
+			break
+		}
+	}
+	return
+}
+
+// runHyprctl runs hyprctl with the Hyprland socket env set correctly.
+func runHyprctl(args ...string) (string, error) {
+	hyprctl := findBin("hyprctl")
+	if hyprctl == "" {
+		return "", fmt.Errorf("hyprctl not found")
+	}
+	sig, runtimeDir := findHyprlandEnv()
+	if sig == "" {
+		return "", fmt.Errorf("HYPRLAND_INSTANCE_SIGNATURE not found")
+	}
+	env := []string{
+		"HYPRLAND_INSTANCE_SIGNATURE=" + sig,
+	}
+	if runtimeDir != "" {
+		env = append(env, "XDG_RUNTIME_DIR="+runtimeDir)
+	}
+	cmd := exec.Command(hyprctl, args...)
+	cmd.Env = env
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+// hyprSocket sends a single command directly to the Hyprland IPC socket and
+// returns the response. Much faster than spawning hyprctl as a subprocess.
+func hyprSocket(cmd string) (string, error) {
+	sig, runtimeDir := findHyprlandEnv()
+	if sig == "" || runtimeDir == "" {
+		return "", fmt.Errorf("hyprland env not found")
+	}
+	conn, err := net.DialTimeout("unix", runtimeDir+"/hypr/"+sig+"/.socket.sock", 100*time.Millisecond)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(100 * time.Millisecond)) //nolint:errcheck
+	conn.Write([]byte(cmd))                                  //nolint:errcheck
+	out, err := io.ReadAll(conn)
+	return strings.TrimSpace(string(out)), err
+}
+
+// readCursorPosHyprland returns the cursor position in Wayland logical
+// coordinates — the same space as our screenW/H.
+func readCursorPosHyprland(w, h int) (int, int, bool) {
+	out, err := hyprSocket("cursorpos")
+	if err != nil {
+		return 0, 0, false
+	}
+	var x, y int
+	if n, _ := fmt.Sscanf(out, "%d, %d", &x, &y); n != 2 {
+		if n, _ := fmt.Sscanf(out, "%d %d", &x, &y); n != 2 {
+			return 0, 0, false
+		}
+	}
+	return clamp(x, 0, w-1), clamp(y, 0, h-1), true
+}
+
+type hyprMonitor struct {
+	Width   int     `json:"width"`
+	Height  int     `json:"height"`
+	Scale   float64 `json:"scale"`
+	Focused bool    `json:"focused"`
+}
+
+// detectScreenSizeHyprland returns the logical screen dimensions and scale of
+// the focused monitor via hyprctl monitors.
+func detectScreenSizeHyprland() (w, h int, scale float64, err error) {
+	out, err := runHyprctl("monitors", "-j")
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("hyprctl monitors: %w", err)
+	}
+	var monitors []hyprMonitor
+	if err := json.Unmarshal([]byte(out), &monitors); err != nil {
+		return 0, 0, 0, fmt.Errorf("parse monitors JSON: %w", err)
+	}
+	if len(monitors) == 0 {
+		return 0, 0, 0, fmt.Errorf("no monitors found")
+	}
+	m := monitors[0]
+	for _, mon := range monitors {
+		if mon.Focused {
+			m = mon
+			break
+		}
+	}
+	scale = m.Scale
+	if scale <= 0 {
+		scale = 1.0
+	}
+	return int(math.Round(float64(m.Width) / scale)),
+		int(math.Round(float64(m.Height) / scale)), scale, nil
+}
+
+// warpCursorHyprland moves the cursor to (x, y) in logical Wayland coordinates.
+func warpCursorHyprland(x, y int) error {
+	_, err := runHyprctl("dispatch", "movecursor", strconv.Itoa(x), strconv.Itoa(y))
+	return err
+}
+
 // detectScreenByCornerSlam determines the screen dimensions in xdotool's
 // coordinate space by moving the cursor to a far corner and reading where it
 // actually lands. This is the most reliable method because it bypasses all
@@ -193,33 +348,6 @@ func detectScreenByCornerSlam() (w, h int, err error) {
 	return maxX + 1, maxY + 1, nil
 }
 
-// readCursorPos returns the actual OS cursor position using xdotool.
-// Returns (x, y, true) on success, (0, 0, false) if xdotool is unavailable.
-func readCursorPos(w, h int) (int, int, bool) {
-	xdotool := findBin("xdotool")
-	if xdotool == "" {
-		return 0, 0, false
-	}
-	display, xauth := findDisplayEnv()
-	if display == "" {
-		return 0, 0, false
-	}
-	env := []string{"DISPLAY=" + display}
-	if xauth != "" {
-		env = append(env, "XAUTHORITY="+xauth)
-	}
-	cmd := exec.Command(xdotool, "getmouselocation")
-	cmd.Env = env
-	out, err := cmd.Output()
-	if err != nil {
-		return 0, 0, false
-	}
-	var x, y int
-	if n, _ := fmt.Sscanf(string(out), "x:%d y:%d", &x, &y); n != 2 {
-		return 0, 0, false
-	}
-	return clamp(x, 0, w-1), clamp(y, 0, h-1), true
-}
 
 // findBin looks for a binary in PATH and common NixOS system locations.
 func findBin(name string) string {

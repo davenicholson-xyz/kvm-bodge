@@ -40,37 +40,35 @@ func main() {
 	// makes edge-position percentages correct.  The old sysfs+scale path is
 	// kept as a fallback and for when --screen is given explicitly.
 	var screenW, screenH int
+	var inputScale float64
 	if *screen != "" {
 		var physW, physH int
 		if _, err := fmt.Sscanf(*screen, "%dx%d", &physW, &physH); err != nil || physW <= 0 || physH <= 0 {
 			log.Fatalf("invalid --screen %q: want WxH e.g. 1920x1080", *screen)
 		}
-		scale := *scaleFlag
-		if scale <= 0 {
-			scale = 1.0
+		inputScale = *scaleFlag
+		if inputScale <= 0 {
+			inputScale = 1.0
 		}
-		screenW = int(math.Round(float64(physW) / scale))
-		screenH = int(math.Round(float64(physH) / scale))
-		log.Printf("screen %dx%d (from --screen flag, scale %.2f)", screenW, screenH, scale)
-	} else if w, h, err := detectScreenByCornerSlam(); err == nil {
-		screenW, screenH = w, h
-		log.Printf("screen %dx%d (corner-slam — guaranteed to match cursor coordinate space)", screenW, screenH)
-		if *scaleFlag > 0 {
-			log.Printf("note: --scale ignored when corner-slam detection succeeds")
-		}
+		screenW = int(math.Round(float64(physW) / inputScale))
+		screenH = int(math.Round(float64(physH) / inputScale))
+		log.Printf("screen %dx%d (from --screen flag, scale %.2f)", screenW, screenH, inputScale)
+	} else if w, h, scale, err := detectScreenSizeHyprland(); err == nil {
+		screenW, screenH, inputScale = w, h, scale
+		log.Printf("screen %dx%d scale %.2f (hyprctl monitors)", screenW, screenH, inputScale)
 	} else {
-		log.Printf("corner-slam unavailable (%v) — falling back to sysfs+kwinrc scale", err)
+		log.Printf("hyprland detection unavailable (%v) — falling back to sysfs+scale", err)
 		physW, physH, err := detectScreenSize()
 		if err != nil {
 			log.Fatalf("auto-detect screen size: %v\nHint: pass --screen WxH to set it manually", err)
 		}
-		scale := *scaleFlag
-		if scale <= 0 {
-			scale = detectScaleFactor()
+		inputScale = *scaleFlag
+		if inputScale <= 0 {
+			inputScale = detectScaleFactor()
 		}
-		screenW = int(math.Round(float64(physW) / scale))
-		screenH = int(math.Round(float64(physH) / scale))
-		log.Printf("screen: physical %dx%d scale %.2f → logical %dx%d", physW, physH, scale, screenW, screenH)
+		screenW = int(math.Round(float64(physW) / inputScale))
+		screenH = int(math.Round(float64(physH) / inputScale))
+		log.Printf("screen: physical %dx%d scale %.2f → logical %dx%d", physW, physH, inputScale, screenW, screenH)
 	}
 
 	// Mouse device.
@@ -138,12 +136,12 @@ func main() {
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
-			handleClient(c, mouse, keyboards, evCh, kbCh, screenW, screenH)
+			handleClient(c, mouse, keyboards, evCh, kbCh, screenW, screenH, inputScale)
 		}
 	}
 }
 
-func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int) {
+func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int, inputScale float64) {
 	remote := c.RemoteAddr()
 	log.Printf("[%s] connected", remote)
 	remoteMode := false
@@ -208,15 +206,11 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 		}
 	}()
 
-	// Seed the virtual tracker from the real cursor position if possible,
-	// otherwise warp to a known position so vx/vy is accurate.
-	var vx, vy int
-	if rx, ry, ok := readCursorPos(screenW, screenH); ok {
-		vx, vy = rx, ry
-		log.Printf("[%s] seeded virtual cursor from real pos (%d,%d)", remote, vx, vy)
-	} else {
-		vx, vy = warpMouseToCenter(screenW, screenH)
-	}
+	// Warp cursor to centre and seed the virtual tracker there.
+	// We don't read back from xdotool — its coordinate space differs from our
+	// logical screen when XWayland applies its own scaling.
+	warpMouseToCenter(screenW, screenH)
+	vx, vy := screenW/2, screenH/2
 	pressedButtons := map[uint16]bool{}
 
 	for {
@@ -229,38 +223,23 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 			switch ev.Kind {
 			case evdev.KindMove:
 				if !remoteMode {
-					nx := clamp(vx+ev.DX, 0, screenW-1)
-					ny := clamp(vy+ev.DY, 0, screenH-1)
-					dbg("virtual (%d,%d) → (%d,%d) delta (%+d,%+d)", vx, vy, nx, ny, ev.DX, ev.DY)
+					if ax, ay, ok := readCursorPosHyprland(screenW, screenH); ok {
+						vx, vy = ax, ay
+					}
+					dbg("actual pos (%d,%d) delta (%+d,%+d)", vx, vy, ev.DX, ev.DY)
 					triggered := pushThrough(vx, vy, ev, side, screenW, screenH)
-					vx, vy = nx, ny
-					// Don't switch screens while a button is held.
 					if triggered && len(pressedButtons) == 0 {
 						remoteMode = true
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
-					if len(keyboards) > 0 {
-						grabOK := 0
 						for _, kb := range keyboards {
 							if err := kb.Grab(); err != nil {
 								log.Printf("[%s] keyboard grab %s failed: %v", remote, kb.Device(), err)
-							} else {
-								grabOK++
 							}
 						}
-						log.Printf("[%s] keyboard grabbed %d/%d devices", remote, grabOK, len(keyboards))
-					} else {
-						log.Printf("[%s] no keyboard device -- forwarding disabled", remote)
-					}
-						// Use actual cursor position for accurate edge percentage;
-						// fall back to virtual position if xdotool is unavailable.
-						ex, ey := nx, ny
-						if ax, ay, ok := readCursorPos(screenW, screenH); ok {
-							ex, ey = ax, ay
-						}
-						pct := edgePosPct(ex, ey, side, screenW, screenH)
-						log.Printf("[%s] push-through — sending mouse to client (edge pos %.1f%%)", remote, pct*100)
+						pct := edgePosPct(vx, vy, side, screenW, screenH)
+						log.Printf("[%s] \u2192 client (%.1f%%)", remote, pct*100)
 						writeCh <- proto.Message{Type: proto.MsgMouseEnter, Payload: proto.EncodeEdgePos(pct)}
 					}
 				} else {
@@ -288,7 +267,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 
 		case ev := <-kbCh:
 			if ev.Kind == evdev.KindKey {
-				log.Printf("[%s] kbCh key %d pressed=%v remoteMode=%v", remote, ev.Button, ev.Pressed, remoteMode)
+				dbg("key %d pressed=%v", ev.Button, ev.Pressed)
 			}
 			if remoteMode && ev.Kind == evdev.KindKey {
 				writeCh <- proto.Message{
@@ -311,18 +290,18 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
-					log.Printf("[%s] mouse returned — edge pos %.1f%% → virtual pos (%d,%d)", remote, pct*100, vx, vy)
+					log.Printf("[%s] ← server (%.1f%%)", remote, pct*100)
 				} else {
 					vx, vy = returnVirtualPos(side, screenW, screenH)
-					log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
-				}
-				// Re-sync virtual position to actual cursor to correct any drift.
-				if ax, ay, ok := readCursorPos(screenW, screenH); ok {
-					vx, vy = ax, ay
-				}
 
+				}
+				// Correct drift with actual Wayland cursor position.
+				if ax, ay, ok := readCursorPosHyprland(screenW, screenH); ok {
+					vx, vy = ax, ay
+				dbg("resynced pos from hyprctl: (%d,%d)", vx, vy)
+				}
 			case proto.MsgBye:
-				log.Printf("[%s] client said bye", remote)
+			dbg("client said bye")
 				return
 			}
 		}
