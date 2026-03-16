@@ -295,14 +295,15 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
+					log.Printf("[%s] mouse returned — edge pos %.1f%% → virtual pos (%d,%d)", remote, pct*100, vx, vy)
 				} else {
 					vx, vy = returnVirtualPos(side, screenW, screenH)
+					log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
 				}
 				// Re-sync virtual position to actual cursor to correct any drift.
 				if ax, ay, ok := readCursorPos(screenW, screenH); ok {
 					vx, vy = ax, ay
 				}
-				log.Printf("[%s] mouse returned — virtual pos (%d,%d)", remote, vx, vy)
 
 			case proto.MsgBye:
 				log.Printf("[%s] client said bye", remote)

@@ -133,11 +133,12 @@ func main() {
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = entryPosFromPct(side, screenW, screenH, pct)
+					log.Printf("mouse entered from server — edge pos %.1f%% → placed at (%d,%d)", pct*100, vx, vy)
 				} else {
 					vx, vy = entryPos(side, screenW, screenH)
+					log.Printf("mouse entered from server — placed at (%d,%d)", vx, vy)
 				}
 				moveMouse(vx, vy, false)
-				log.Printf("mouse entered from server — placed at (%d,%d)", vx, vy)
 
 			case proto.MsgMouseDelta:
 				if !remoteMode || len(m.Payload) < 8 {
