@@ -48,9 +48,15 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", *server, *port)
 	log.Printf("connecting to %s (this monitor is to the %s of server)", addr, *sideStr)
 
-	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		log.Fatalf("connect: %v", err)
+	var c net.Conn
+	for {
+		var err error
+		c, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		if err == nil {
+			break
+		}
+		log.Printf("connect: %v — retrying in 5s", err)
+		time.Sleep(5 * time.Second)
 	}
 	defer c.Close()
 
