@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -31,6 +32,7 @@ func main() {
 	kbInput := flag.String("keyboard", "", "evdev keyboard device path (default: auto-detect)")
 	screen := flag.String("screen", "", "logical screen resolution WxH override (default: auto-detect)")
 	scaleFlag := flag.Float64("scale", 0, "display scale factor override, e.g. 1.25 (default: auto-detect)")
+	statusSock := flag.String("status-socket", "/tmp/kvmux.sock", "Unix socket path for status broadcasts")
 	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
@@ -99,8 +101,11 @@ func main() {
 	defer ln.Close()
 	log.Printf("KVM server listening on %s", addr)
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	sb := newStatusBroadcaster()
+	go sb.serve(ctx, *statusSock)
 
 	evCh := make(chan evdev.Event, 256)
 	go func() {
@@ -132,19 +137,20 @@ func main() {
 
 	for {
 		select {
-		case <-sig:
+		case <-ctx.Done():
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
-			handleClient(c, mouse, keyboards, evCh, kbCh, screenW, screenH, inputScale)
+			handleClient(ctx, c, sb, mouse, keyboards, evCh, kbCh, screenW, screenH, inputScale)
 		}
 	}
 }
 
-func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int, inputScale float64) {
+func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse *evdev.Reader, keyboards []*evdev.Reader, evCh <-chan evdev.Event, kbCh <-chan evdev.Event, screenW, screenH int, inputScale float64) {
 	remote := c.RemoteAddr()
 	log.Printf("[%s] connected", remote)
 	remoteMode := false
+	sb.publish(Status{Connected: true, Remote: false, Client: remote.String()})
 	defer func() {
 		c.Close()
 		if remoteMode {
@@ -154,6 +160,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 			for _, kb := range keyboards { kb.Ungrab() }
 			log.Printf("[%s] ungrabbed devices on disconnect", remote)
 		}
+		sb.publish(Status{})
 		log.Printf("[%s] disconnected", remote)
 	}()
 
@@ -215,6 +222,10 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Printf("[%s] shutting down", remote)
+			return
+
 		case err := <-errCh:
 			log.Printf("[%s] error: %v", remote, err)
 			return
@@ -230,6 +241,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 					triggered := pushThrough(vx, vy, ev, side, screenW, screenH)
 					if triggered && len(pressedButtons) == 0 {
 						remoteMode = true
+						sb.publish(Status{Connected: true, Remote: true, Client: remote.String()})
 						if err := mouse.Grab(); err != nil {
 							log.Printf("[%s] grab failed: %v", remote, err)
 						}
@@ -287,6 +299,7 @@ func handleClient(c net.Conn, mouse *evdev.Reader, keyboards []*evdev.Reader, ev
 					log.Printf("[%s] ungrab failed: %v", remote, err)
 				}
 				for _, kb := range keyboards { kb.Ungrab() }
+				sb.publish(Status{Connected: true, Remote: false, Client: remote.String()})
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = returnVirtualPosFromPct(side, screenW, screenH, pct)
