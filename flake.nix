@@ -16,8 +16,8 @@
           version = "0.1.0";
           src = ./.;
           subPackages = [ "cmd/kvmux-server" ];
-          vendorHash = nixpkgs.lib.fakeHash;
-          CGO_ENABLED = "1";
+          vendorHash = "sha256-96af9CfOQPt46vJbWd74ClYUkz2g5N7JTM2tJ1zL/AI=";
+          env.CGO_ENABLED = "1";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = with pkgs; [ libx11 libxtst libxext libxinerama libxi libpng ];
         };
