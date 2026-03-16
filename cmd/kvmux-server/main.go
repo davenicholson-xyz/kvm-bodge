@@ -44,6 +44,7 @@ func main() {
 	// kept as a fallback and for when --screen is given explicitly.
 	var screenW, screenH int
 	var inputScale float64
+	screenFixed := false // true when dimensions came from --screen flag (don't retry)
 	if *screen != "" {
 		var physW, physH int
 		if _, err := fmt.Sscanf(*screen, "%dx%d", &physW, &physH); err != nil || physW <= 0 || physH <= 0 {
@@ -56,9 +57,11 @@ func main() {
 		screenW = int(math.Round(float64(physW) / inputScale))
 		screenH = int(math.Round(float64(physH) / inputScale))
 		log.Printf("screen %dx%d (from --screen flag, scale %.2f)", screenW, screenH, inputScale)
+		screenFixed = true
 	} else if w, h, scale, err := detectScreenSizeHyprland(); err == nil {
 		screenW, screenH, inputScale = w, h, scale
 		log.Printf("screen %dx%d scale %.2f (hyprctl monitors)", screenW, screenH, inputScale)
+		screenFixed = true
 	} else {
 		log.Printf("hyprland detection unavailable (%v) — falling back to sysfs+scale", err)
 		physW, physH, err := detectScreenSize()
@@ -71,7 +74,7 @@ func main() {
 		}
 		screenW = int(math.Round(float64(physW) / inputScale))
 		screenH = int(math.Round(float64(physH) / inputScale))
-		log.Printf("screen: physical %dx%d scale %.2f → logical %dx%d", physW, physH, inputScale, screenW, screenH)
+		log.Printf("screen: physical %dx%d scale %.2f → logical %dx%d (will retry on connect)", physW, physH, inputScale, screenW, screenH)
 	}
 
 	// Mouse device.
@@ -142,6 +145,14 @@ func main() {
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
+			// If we fell back to sysfs at startup (Hyprland wasn't ready), retry now.
+			if !screenFixed {
+				if w, h, scale, err := detectScreenSizeHyprland(); err == nil {
+					screenW, screenH, inputScale = w, h, scale
+					screenFixed = true
+					log.Printf("screen re-detected on connect: %dx%d scale %.2f (hyprctl monitors)", screenW, screenH, inputScale)
+				}
+			}
 			handleClient(ctx, c, sb, mouse, keyboards, evCh, kbCh, screenW, screenH, inputScale)
 		}
 	}
