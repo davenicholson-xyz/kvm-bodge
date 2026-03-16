@@ -277,6 +277,13 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 						pct := edgePosPct(vx, vy, side, screenW, screenH)
 						log.Printf("[%s] \u2192 client (%.1f%%) — awaiting ack", remote, pct*100)
 						writeCh <- proto.Message{Type: proto.MsgMouseEnter, Payload: proto.EncodeEdgePos(pct)}
+						if clip := readClipboard(); clip != "" {
+							payload := []byte(clip)
+							if len(payload) > 0xFFFF {
+								payload = payload[:0xFFFF]
+							}
+							writeCh <- proto.Message{Type: proto.MsgClipboard, Payload: payload}
+						}
 					}
 				} else {
 					dbg("remote move (%+d,%+d) scroll(%+d,%+d)", ev.DX, ev.DY, ev.WheelV, ev.WheelH)

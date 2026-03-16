@@ -206,6 +206,12 @@ func main() {
 					robotgo.KeyUp(key)
 				}
 
+			case proto.MsgClipboard:
+				if len(m.Payload) > 0 {
+					writeClipboard(string(m.Payload))
+					dbg("clipboard updated (%d bytes)", len(m.Payload))
+				}
+
 			case proto.MsgBye:
 				log.Println("server said bye")
 				releaseAllKeys(pressedKeys)

@@ -25,6 +25,7 @@ const (
 	MsgMouseButton   MsgType = 0x09 // server→client: uint16 button, uint8 state
 	MsgKeyEvent      MsgType = 0x0A // server→client: uint16 keycode, uint8 state
 	MsgMouseEnterAck MsgType = 0x0B // client→server: confirms mouse control received
+	MsgClipboard     MsgType = 0x0C // either direction: UTF-8 clipboard text
 )
 
 const (

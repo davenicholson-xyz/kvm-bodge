@@ -349,6 +349,87 @@ func detectScreenByCornerSlam() (w, h int, err error) {
 }
 
 
+// readClipboard returns the current clipboard text, trying wl-paste (Wayland)
+// then xclip (X11). Returns "" if neither succeeds.
+func readClipboard() string {
+	if wlPaste := findBin("wl-paste"); wlPaste != "" {
+		wlDisp, xdgRun := findWaylandEnv()
+		if wlDisp != "" && xdgRun != "" {
+			cmd := exec.Command(wlPaste, "--no-newline")
+			cmd.Env = []string{
+				"WAYLAND_DISPLAY=" + wlDisp,
+				"XDG_RUNTIME_DIR=" + xdgRun,
+			}
+			if out, err := cmd.Output(); err == nil {
+				return string(out)
+			}
+		}
+	}
+	if xclip := findBin("xclip"); xclip != "" {
+		display, xauth := findDisplayEnv()
+		if display != "" {
+			env := []string{"DISPLAY=" + display}
+			if xauth != "" {
+				env = append(env, "XAUTHORITY="+xauth)
+			}
+			cmd := exec.Command(xclip, "-o", "-selection", "clipboard")
+			cmd.Env = env
+			if out, err := cmd.Output(); err == nil {
+				return string(out)
+			}
+		}
+	}
+	return ""
+}
+
+// findWaylandEnv returns WAYLAND_DISPLAY and XDG_RUNTIME_DIR, scanning /proc
+// when running under sudo so the user's Wayland session is found.
+func findWaylandEnv() (display, runtimeDir string) {
+	display = os.Getenv("WAYLAND_DISPLAY")
+	runtimeDir = os.Getenv("XDG_RUNTIME_DIR")
+	if display != "" && runtimeDir != "" {
+		return
+	}
+	username := os.Getenv("SUDO_USER")
+	if username == "" {
+		username = os.Getenv("USER")
+	}
+	u, err := user.Lookup(username)
+	if err != nil {
+		return
+	}
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := os.Lstat("/proc/" + e.Name())
+		if err != nil {
+			continue
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || strconv.Itoa(int(st.Uid)) != u.Uid {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
+		if err != nil {
+			continue
+		}
+		for _, kv := range strings.Split(string(data), "\x00") {
+			if display == "" && strings.HasPrefix(kv, "WAYLAND_DISPLAY=") {
+				display = strings.TrimPrefix(kv, "WAYLAND_DISPLAY=")
+			}
+			if runtimeDir == "" && strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") {
+				runtimeDir = strings.TrimPrefix(kv, "XDG_RUNTIME_DIR=")
+			}
+		}
+		if display != "" && runtimeDir != "" {
+			break
+		}
+	}
+	return
+}
+
 // findBin looks for a binary in PATH and common NixOS system locations.
 func findBin(name string) string {
 	if p, err := exec.LookPath(name); err == nil {
