@@ -2,3 +2,5 @@
 /.direnv
 /client
 /server
+/kvmux-server
+/kvmux-client
