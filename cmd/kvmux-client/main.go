@@ -30,6 +30,7 @@ func main() {
 	port := flag.Int("port", 7777, "server port")
 	sideStr := flag.String("side", cfg.Side, "which side of the server this monitor is on: left|right|top|bottom")
 	scrollSpeed := flag.Int("scroll-speed", 50, "scroll wheel multiplier")
+	reverseScroll := flag.Bool("reverse-scroll", cfg.ReverseScroll, "reverse scroll direction")
 	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
@@ -158,11 +159,15 @@ func main() {
 				vx = clamp(vx+dx, 0, screenW-1)
 				vy = clamp(vy+dy, 0, screenH-1)
 				moveMouse(vx, vy, pressedButtons[0x110])
+				scrollDir := 1
+				if *reverseScroll {
+					scrollDir = -1
+				}
 				if wv != 0 {
-					robotgo.Scroll(0, -wv**scrollSpeed)
+					robotgo.Scroll(0, scrollDir*-wv**scrollSpeed)
 				}
 				if wh != 0 {
-					robotgo.Scroll(wh**scrollSpeed, 0)
+					robotgo.Scroll(scrollDir*wh**scrollSpeed, 0)
 				}
 				dbg("delta (%+d,%+d) scroll(%+d,%+d) → virtual (%d,%d)", dx, dy, wv, wh, vx, vy)
 

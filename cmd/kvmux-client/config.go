@@ -6,8 +6,9 @@ import (
 )
 
 type config struct {
-	Server string
-	Side   string
+	Server        string
+	Side          string
+	ReverseScroll bool
 }
 
 // loadConfig reads config.toml from the same directory as the binary (or cwd).
@@ -59,6 +60,8 @@ func parseToml(data []byte) config {
 			c.Server = v
 		case "side":
 			c.Side = v
+		case "reverse-scroll":
+			c.ReverseScroll = v == "true"
 		}
 	}
 	return c
