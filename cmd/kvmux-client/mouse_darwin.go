@@ -7,9 +7,9 @@ package main
 #include <ApplicationServices/ApplicationServices.h>
 #include <time.h>
 
-static struct timespec gLastClickTime[3];
-static CGPoint        gLastClickPos[3];
-static int            gClickCount[3];
+static struct timespec gLastClickTime[5];
+static CGPoint        gLastClickPos[5];
+static int            gClickCount[5];
 
 static double msElapsed(struct timespec a, struct timespec b) {
 	return (double)(a.tv_sec  - b.tv_sec)  * 1000.0
@@ -24,7 +24,7 @@ void kvmMoveMouse(int x, int y, int dragging) {
 	CFRelease(ev);
 }
 
-// btnIdx: 0=left, 1=right, 2=middle
+// btnIdx: 0=left, 1=right, 2=middle, 3=back, 4=forward
 void kvmMouseButton(int btnIdx, int pressed, int x, int y) {
 	CGMouseButton cgBtn;
 	CGEventType   downType, upType;
@@ -40,7 +40,7 @@ void kvmMouseButton(int btnIdx, int pressed, int x, int y) {
 		upType   = kCGEventRightMouseUp;
 		break;
 	default:
-		cgBtn    = kCGMouseButtonCenter;
+		cgBtn    = (CGMouseButton)btnIdx;
 		downType = kCGEventOtherMouseDown;
 		upType   = kCGEventOtherMouseUp;
 		break;
@@ -106,6 +106,10 @@ func evdevButtonIndex(code uint16) int {
 		return 1 // right
 	case 0x112:
 		return 2 // middle
+	case 0x113:
+		return 3 // side (back)
+	case 0x114:
+		return 4 // extra (forward)
 	}
 	return -1
 }

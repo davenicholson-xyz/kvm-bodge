@@ -288,6 +288,10 @@ func evdevButtonToRobotgo(code uint16) string {
 		return "right"
 	case 0x112:
 		return "center"
+	case 0x113:
+		return "back"
+	case 0x114:
+		return "forward"
 	}
 	return ""
 }
