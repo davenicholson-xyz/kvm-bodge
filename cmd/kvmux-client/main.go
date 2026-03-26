@@ -26,11 +26,17 @@ func dbg(format string, args ...any) {
 func main() {
 	cfg := loadConfig()
 
+	idleDefault := 30
+	if cfg.IdleTimeout > 0 {
+		idleDefault = cfg.IdleTimeout
+	}
+
 	server := flag.String("server", cfg.Server, "server IP or host")
 	port := flag.Int("port", 7777, "server port")
 	sideStr := flag.String("side", cfg.Side, "which side of the server this monitor is on: left|right|top|bottom")
 	scrollSpeed := flag.Int("scroll-speed", 50, "scroll wheel multiplier")
 	reverseScroll := flag.Bool("reverse-scroll", cfg.ReverseScroll, "reverse scroll direction")
+	idleTimeoutSec := flag.Int("idle-timeout", idleDefault, "seconds of mouse inactivity before returning to server (0 = disabled)")
 	flag.BoolVar(&debug, "debug", false, "verbose debug output")
 	flag.Parse()
 
@@ -81,6 +87,8 @@ func main() {
 	}
 	log.Printf("handshake OK — connected to %s", addr)
 
+	idleTimeout := time.Duration(*idleTimeoutSec) * time.Second
+
 	startSleepWatcher()
 
 	// --- Set up goroutines ---
@@ -123,6 +131,20 @@ func main() {
 	pressedButtons := map[uint16]bool{}
 	pressedKeys := map[uint16]bool{}
 
+	idleTimer := time.NewTimer(0)
+	idleTimer.Stop()
+	resetIdle := func() {
+		if idleTimeout > 0 {
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleTimeout)
+		}
+	}
+
 	for {
 		select {
 		case <-sig:
@@ -130,6 +152,16 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 			log.Println("bye")
 			return
+
+		case <-idleTimer.C:
+			if remoteMode {
+				remoteMode = false
+				idleTimer.Stop()
+				releaseAllKeys(pressedKeys)
+				clear(pressedButtons)
+				writeCh <- proto.Message{Type: proto.MsgMouseLeave, Payload: proto.EncodeEdgePos(0.5)}
+				log.Printf("idle timeout (%ds) — mouse returned to server", *idleTimeoutSec)
+			}
 
 		case <-sleepCh:
 			log.Println("system sleep — returning mouse to server")
@@ -152,6 +184,7 @@ func main() {
 
 			case proto.MsgMouseEnter:
 				remoteMode = true
+				resetIdle()
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
 					vx, vy = entryPosFromPct(side, screenW, screenH, pct)
@@ -167,6 +200,7 @@ func main() {
 				if !remoteMode || len(m.Payload) < 8 {
 					continue
 				}
+				resetIdle()
 				dx, dy, wv, wh := proto.DecodeMouseDelta(m.Payload)
 				vx = clamp(vx+dx, 0, screenW-1)
 				vy = clamp(vy+dy, 0, screenH-1)

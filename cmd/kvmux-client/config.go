@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -9,6 +10,7 @@ type config struct {
 	Server        string
 	Side          string
 	ReverseScroll bool
+	IdleTimeout   int // seconds; 0 = disabled
 }
 
 // loadConfig reads config.toml from the same directory as the binary (or cwd).
@@ -62,6 +64,8 @@ func parseToml(data []byte) config {
 			c.Side = v
 		case "reverse-scroll":
 			c.ReverseScroll = v == "true"
+		case "idle-timeout":
+			fmt.Sscanf(v, "%d", &c.IdleTimeout)
 		}
 	}
 	return c
