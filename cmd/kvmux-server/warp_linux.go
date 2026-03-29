@@ -69,6 +69,18 @@ func warpMouseToCenter(w, h int) (vx, vy int) {
 		return w / 2, h / 2
 	}
 
+	// --- try ydotool (Wayland-native, no display env needed) ---
+	if ydotool := findBin("ydotool"); ydotool != "" {
+		cmd := exec.Command(ydotool, "mousemove", "--absolute", "--",
+			strconv.Itoa(w/2), strconv.Itoa(h/2))
+		if err := cmd.Run(); err != nil {
+			log.Printf("ydotool mousemove: %v", err)
+		} else {
+			log.Printf("cursor warped to centre (%d,%d) via ydotool", w/2, h/2)
+			return w / 2, h / 2
+		}
+	}
+
 	// --- try xdotool ---
 	display, xauth := findDisplayEnv()
 	xdotool := findBin("xdotool")
@@ -294,6 +306,64 @@ func detectScreenSizeHyprland() (w, h int, scale float64, err error) {
 func warpCursorHyprland(x, y int) error {
 	_, err := runHyprctl("dispatch", "movecursor", strconv.Itoa(x), strconv.Itoa(y))
 	return err
+}
+
+// findNiriSocket returns the path to the niri IPC socket, scanning /proc when
+// running under sudo so the user's session socket is found.
+func findNiriSocket() string {
+	if s := os.Getenv("NIRI_SOCKET"); s != "" {
+		return s
+	}
+	// findWaylandEnv already scans /proc for XDG_RUNTIME_DIR.
+	_, runtimeDir := findWaylandEnv()
+	if runtimeDir != "" {
+		return runtimeDir + "/niri/socket"
+	}
+	return ""
+}
+
+type niriLogical struct {
+	Width  int     `json:"width"`
+	Height int     `json:"height"`
+	Scale  float64 `json:"scale"`
+}
+
+type niriOutput struct {
+	Logical *niriLogical `json:"logical"`
+}
+
+// detectScreenSizeNiri returns the logical screen dimensions and scale of the
+// first output (with a connected logical mode) via `niri msg -j outputs`.
+func detectScreenSizeNiri() (w, h int, scale float64, err error) {
+	niri := findBin("niri")
+	if niri == "" {
+		return 0, 0, 0, fmt.Errorf("niri not found")
+	}
+	sock := findNiriSocket()
+	if sock == "" {
+		return 0, 0, 0, fmt.Errorf("niri socket not found")
+	}
+	cmd := exec.Command(niri, "msg", "-j", "outputs")
+	cmd.Env = []string{"NIRI_SOCKET=" + sock}
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("niri msg outputs: %w", err)
+	}
+	var outputs map[string]niriOutput
+	if err := json.Unmarshal(out, &outputs); err != nil {
+		return 0, 0, 0, fmt.Errorf("parse niri outputs JSON: %w", err)
+	}
+	for _, o := range outputs {
+		if o.Logical == nil || o.Logical.Width <= 0 || o.Logical.Height <= 0 {
+			continue
+		}
+		sc := o.Logical.Scale
+		if sc <= 0 {
+			sc = 1.0
+		}
+		return o.Logical.Width, o.Logical.Height, sc, nil
+	}
+	return 0, 0, 0, fmt.Errorf("no output with logical mode found")
 }
 
 // detectScreenByCornerSlam determines the screen dimensions in xdotool's

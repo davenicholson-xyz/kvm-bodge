@@ -62,8 +62,12 @@ func main() {
 		screenW, screenH, inputScale = w, h, scale
 		log.Printf("screen %dx%d scale %.2f (hyprctl monitors)", screenW, screenH, inputScale)
 		screenFixed = true
+	} else if w, h, scale, err := detectScreenSizeNiri(); err == nil {
+		screenW, screenH, inputScale = w, h, scale
+		log.Printf("screen %dx%d scale %.2f (niri outputs)", screenW, screenH, inputScale)
+		screenFixed = true
 	} else {
-		log.Printf("hyprland detection unavailable (%v) — falling back to sysfs+scale", err)
+		log.Printf("compositor detection unavailable — falling back to sysfs+scale")
 		physW, physH, err := detectScreenSize()
 		if err != nil {
 			log.Fatalf("auto-detect screen size: %v\nHint: pass --screen WxH to set it manually", err)
@@ -145,12 +149,16 @@ func main() {
 			log.Println("shutting down")
 			return
 		case c := <-connCh:
-			// If we fell back to sysfs at startup (Hyprland wasn't ready), retry now.
+			// If we fell back to sysfs at startup (compositor wasn't ready), retry now.
 			if !screenFixed {
 				if w, h, scale, err := detectScreenSizeHyprland(); err == nil {
 					screenW, screenH, inputScale = w, h, scale
 					screenFixed = true
 					log.Printf("screen re-detected on connect: %dx%d scale %.2f (hyprctl monitors)", screenW, screenH, inputScale)
+				} else if w, h, scale, err := detectScreenSizeNiri(); err == nil {
+					screenW, screenH, inputScale = w, h, scale
+					screenFixed = true
+					log.Printf("screen re-detected on connect: %dx%d scale %.2f (niri outputs)", screenW, screenH, inputScale)
 				}
 			}
 			handleClient(ctx, c, sb, mouse, keyboards, evCh, kbCh, screenW, screenH, inputScale)
@@ -169,7 +177,9 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 			if err := mouse.Ungrab(); err != nil {
 				log.Printf("[%s] ungrab on disconnect: %v", remote, err)
 			}
-			for _, kb := range keyboards { kb.Ungrab() }
+			for _, kb := range keyboards {
+				kb.Ungrab()
+			}
 			log.Printf("[%s] ungrabbed devices on disconnect", remote)
 		}
 		sb.publish(Status{})
@@ -225,11 +235,7 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 		}
 	}()
 
-	// Warp cursor to centre and seed the virtual tracker there.
-	// We don't read back from xdotool — its coordinate space differs from our
-	// logical screen when XWayland applies its own scaling.
-	warpMouseToCenter(screenW, screenH)
-	vx, vy := screenW/2, screenH/2
+	vx, vy := warpMouseToCenter(screenW, screenH)
 	pressedButtons := map[uint16]bool{}
 	var pendingRemote bool
 	var enterTimeout <-chan time.Time
@@ -249,7 +255,9 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 				log.Printf("[%s] no ack for MsgMouseEnter — reverting to local", remote)
 				pendingRemote = false
 				mouse.Ungrab()
-				for _, kb := range keyboards { kb.Ungrab() }
+				for _, kb := range keyboards {
+					kb.Ungrab()
+				}
 				sb.publish(Status{Connected: true, Remote: false, Client: remote.String()})
 			}
 			enterTimeout = nil
@@ -258,8 +266,13 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 			switch ev.Kind {
 			case evdev.KindMove:
 				if !remoteMode && !pendingRemote {
+					// Prefer reading actual cursor position from the compositor;
+					// fall back to dead-reckoning from deltas when unavailable.
 					if ax, ay, ok := readCursorPosHyprland(screenW, screenH); ok {
 						vx, vy = ax, ay
+					} else {
+						vx = clamp(vx+ev.DX, 0, screenW-1)
+						vy = clamp(vy+ev.DY, 0, screenH-1)
 					}
 					dbg("actual pos (%d,%d) delta (%+d,%+d)", vx, vy, ev.DX, ev.DY)
 					triggered := pushThrough(vx, vy, ev, side, screenW, screenH)
@@ -338,7 +351,9 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 				if err := mouse.Ungrab(); err != nil {
 					log.Printf("[%s] ungrab failed: %v", remote, err)
 				}
-				for _, kb := range keyboards { kb.Ungrab() }
+				for _, kb := range keyboards {
+					kb.Ungrab()
+				}
 				sb.publish(Status{Connected: true, Remote: false, Client: remote.String()})
 				if len(m.Payload) >= 2 {
 					pct := proto.DecodeEdgePos(m.Payload)
@@ -346,15 +361,15 @@ func handleClient(ctx context.Context, c net.Conn, sb *statusBroadcaster, mouse 
 					log.Printf("[%s] ← server (%.1f%%)", remote, pct*100)
 				} else {
 					vx, vy = returnVirtualPos(side, screenW, screenH)
-
 				}
-				// Correct drift with actual Wayland cursor position.
+				// Correct drift with actual compositor cursor position.
 				if ax, ay, ok := readCursorPosHyprland(screenW, screenH); ok {
 					vx, vy = ax, ay
-				dbg("resynced pos from hyprctl: (%d,%d)", vx, vy)
+					dbg("resynced pos from hyprctl: (%d,%d)", vx, vy)
 				}
+
 			case proto.MsgBye:
-			dbg("client said bye")
+				dbg("client said bye")
 				return
 			}
 		}
@@ -411,7 +426,6 @@ func returnVirtualPosFromPct(side byte, w, h int, pct float64) (x, y int) {
 	}
 	return w / 2, h / 2
 }
-
 
 func returnVirtualPos(side byte, w, h int) (x, y int) {
 	switch side {
