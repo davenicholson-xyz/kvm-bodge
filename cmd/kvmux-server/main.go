@@ -109,7 +109,7 @@ func main() {
 	defer ln.Close()
 	log.Printf("KVM server listening on %s", addr)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 
 	sb := newStatusBroadcaster()
